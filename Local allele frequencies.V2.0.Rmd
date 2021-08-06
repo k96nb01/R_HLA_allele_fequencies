@@ -1,0 +1,317 @@
+---
+title: "Local allele frequencies.rmd"
+output: html_notebook
+---
+```{r}
+#This project requires 4 plugins, which can be installed with this code:
+install.packages("odbc")
+install.packages("DBI")
+install.packages("openxlsx")
+install.packages("tidyverse")
+```
+
+```{r}
+#Loading libraries. After the packages above are installed, they need to be loaded. They only need to be installed on a computer once, but they need to be loaded every time RStudio is opened.
+#The memory.limit function was required on the computer I used to increase the memory size so that large tables could be loaded. It may not be needed in all cases.
+library(odbc)
+library(DBI)
+library(openxlsx)
+library(tidyverse)
+memory.limit(size=56000)
+```
+
+```{r}
+#This code connects to the HistoTrac database. The computer RStudio is running on needs to have access to HistoTrac, and the settings for your particular HistoTrac configuration may be different.
+
+# Connecting to the HistoTrac database
+con <- dbConnect(odbc::odbc(), "Histotrac", timeout = 10)
+
+#Pulling a list of available tables in HistoTrac and adding it to "HTtableList"
+(HTtableList <- dbListTables(con) %>% as_tibble)
+
+#This will show all of the tables in the HistoTrac database. Not all of them are used, and only a few are required to search for families.
+```
+#The following code chunks will extract each of the necessary tables from HistoTrac, load them into R in the computer's memory, and then write them to a rds file in the active directory.
+```{r}
+#Extract and save Sample table. Use as a template for extracting and saving tables; just change the table names in the second and third lines of code. This uses the direct extraction code. If this doesn't work, use the error-correcting code based on the "Patient" table.
+con <- dbConnect(odbc::odbc(), "HistoTrac", timeout = 10)
+(dtSample <- dbReadTable(con, "Sample") %>% as_tibble)
+#The code below saves the table in "rds" format, an R format that preserves the table structure, and results in smaller files than "csv.gz." The only limitation is the rds file can only be opened in R. If for some reason you need to read the files by another system, use the second line of code (remove the "#") to save it as a csv.gz file.
+saveRDS(dtSample, file = "Sample.rds")
+#dtSample %>% write_csv("Sample.csv.gz")
+```
+
+```{r}
+#Extract Test table. The Test table required error-correcting code. This is one of the larger tables, and may take a while to extract.
+con <- dbConnect(odbc::odbc(), "HistoTrac", timeout = 10)
+testpull <- function(con, tbnm, rownumber, ls_colnm, sp, ep) {
+  re <- tryCatch({
+    # try to query database based on given start point and end point of column
+    dt <- dbGetQuery(con, paste("SELECT TOP", rownumber, paste0(ls_colnm[sp:ep], collapse = ', '), "FROM", tbnm))
+    return(dt)
+  },
+  error = function(error_message) {
+    return("error")
+  },
+  warning = function(warning_message) {
+    return("warning")
+  }
+  )
+}
+pull <- function(con, tbnm) {
+  # get total row number based on table name
+  rownumber <- dbGetQuery(con, paste("SELECT count(*) FROM", tbnm))[[1]]
+  # get all column names of the table
+  ls_colnm <- c(dbGetQuery(con, paste("SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME='",tbnm,"'",sep=""))$COLUMN_NAME)
+  # set up variables for iteration
+  colnumber <- length(ls_colnm)
+  mincolnbr <- 1
+  maxcolnbr <- colnumber
+  sp <- mincolnbr
+  ep <- maxcolnbr
+  # initiate an empty dataframe
+  df_total <- setNames(data.frame(matrix(nrow=rownumber, ncol=1)),c("x"))
+  
+  while (dim(df_total)[2] < maxcolnbr) {
+    #print(c(sp,ep))
+    df_test <- testpull(con, tbnm, rownumber, ls_colnm, sp, ep)
+    #print(typeof(df_test))
+    if (typeof(df_test) == "list") {
+      # save successfully pulled data
+      if (c(colnames(df_total))[1] == "x") {
+        df_total <- subset(cbind(df_total, df_test),select=-c(x))
+      }
+      else {
+        df_total <- cbind(df_total, df_test)
+      }
+      if (dim(df_total)[2] < maxcolnbr) {
+        # adjust both start and end points when testpull succeeded
+        sp <- ep + 1
+        ep <- maxcolnbr
+        #print(c(sp, ep))
+      }
+    }
+    else {
+      dbDisconnect(con)
+      con <- dbConnect(odbc::odbc(), "HistoTrac", timeout = 10)
+      # adjust end point when testpull failed
+      ep <- floor(sp-1+((ep-(sp-1))/2))
+      #print(c(sp, ep))
+    }
+  }
+  return(df_total)
+}
+
+(dtTest <- pull(con, "Test") %>% as_tibble)
+saveRDS(dtTest, file = "Test.rds")
+#dtTest %>% write_csv("Test.csv.gz")
+```
+#Now a copy of the necessary HistoTrac tables are saved as csv files. The next section loads these back into R, and manipulates the data to find families. You can start here if you have the tables saved, and don't need to interface with HistoTrac.
+```{r}
+#This pulls in the Patient, Sample and Test tables from HistoTrac.
+(total_patient_table <- readRDS(file = "Patient.rds") %>% mutate(across(where(is.character), ~na_if(., ""))))
+(Sample <- readRDS(file = "Sample.rds") %>% mutate(across(where(is.character), ~na_if(., ""))))
+(Test <- readRDS(file = "Test.rds") %>% mutate(across(where(is.character), ~na_if(., ""))))
+```
+#The next set of code links the total_patient_table to the test table so we can determine which patients and donors have been tested by NGS. 
+```{r}
+#This links total_patient_table with the Sample table, then the Test table. 
+(patients_linked_to_test <- 
+   (total_patient_table %>%
+   left_join(Sample, "PatientId")
+      %>% left_join(Test, c("SampleID" = "SampleId"))
+   
+#Filter for NGS tested samples. You may have a different way to determine what samples were tested by NGS.
+   %>% filter(TestTypeCd == "HR NGS")
+   )
+  )
+```
+
+```{r}
+#Simplify the table of NGS tested patients
+(NGStested_patients <- patients_linked_to_test %>% select(PatientId, HospitalID, firstnm:lastnm, mA1Cd.x:mDPB12cd))
+```
+
+```{r}
+#Frequency calculations for HLA-A
+
+#Calculate number of patients with A typing
+(HLA_A_n <- NGStested_patients %>% 
+  filter(!is.na(mA1Cd.x)) %>%
+  filter(str_detect(mA1Cd.x, ":")) %>% #This filters out typing in low resolution
+  nrow()
+)
+#Calculate counts and frequencies of HLA-A alleles. Looks for alleles in both of the A typing fields. 
+(HLA_A_freqs <- NGStested_patients %>% 
+  filter(!is.na(mA1Cd.x)) %>%
+  filter(str_detect(mA1Cd.x, ":")) %>%
+  mutate(mA2Cd.x = coalesce(mA2Cd.x, mA1Cd.x)) %>%
+  select(starts_with("mA")) %>%
+  pivot_longer(cols = everything(), values_to = "A_allele") %>%
+  count(A_allele, name = "Count") %>%
+  arrange(desc(Count)) %>%
+  mutate(Freq = Count/HLA_A_n/2)
+)
+write.xlsx(HLA_A_freqs, file = "HLA-A frequencies.xlsx", overwrite = T)
+```
+
+```{r}
+#Frequency calculations for HLA-B
+
+#Calculate number of patients with B typing
+(HLA_B_n <- NGStested_patients %>% 
+  filter(!is.na(mB1Cd.x)) %>%
+  filter(str_detect(mB1Cd.x, ":")) %>% #This filters out typing in low resolution
+  nrow()
+)
+#Calculate counts and frequencies of HLA-B alleles. Looks for alleles in both of the B typing fields. 
+(HLA_B_freqs <- NGStested_patients %>% 
+  filter(!is.na(mB1Cd.x)) %>%
+  filter(str_detect(mB1Cd.x, ":")) %>%
+  mutate(mB2Cd.x = coalesce(mB2Cd.x, mB1Cd.x)) %>%
+  select(starts_with("mB")) %>%
+  pivot_longer(cols = everything(), values_to = "B_allele") %>%
+  count(B_allele, name = "Count") %>%
+  arrange(desc(Count)) %>%
+  mutate(Freq = Count/HLA_B_n/2)
+)
+write.xlsx(HLA_B_freqs, file = "HLA-B frequencies.xlsx", overwrite = T)
+```
+
+```{r}
+#Frequency calculations for HLA-C
+
+#Calculate number of patients with C typing
+(HLA_C_n <- NGStested_patients %>% 
+  filter(!is.na(mC1Cd.x)) %>%
+  filter(str_detect(mC1Cd.x, ":")) %>% #This filters out typing in low resolution
+  nrow()
+)
+#Calculate counts and frequencies of HLA-C alleles. Looks for alleles in both of the C typing fields. 
+(HLA_C_freqs <- NGStested_patients %>% 
+  filter(!is.na(mC1Cd.x)) %>%
+  filter(str_detect(mC1Cd.x, ":")) %>%
+  mutate(mC2Cd.x = coalesce(mC2Cd.x, mC1Cd.x)) %>%
+  select(starts_with("mC")) %>%
+  pivot_longer(cols = everything(), values_to = "C_allele") %>%
+  count(C_allele, name = "Count") %>%
+  arrange(desc(Count)) %>%
+  mutate(Freq = Count/HLA_C_n/2)
+)
+write.xlsx(HLA_C_freqs, file = "HLA-C frequencies.xlsx", overwrite = T)
+```
+
+```{r}
+#Frequency calculations for HLA-DRB1
+
+#Calculate number of patients with DRB1 typing
+(HLA_DRB1_n <- NGStested_patients %>% 
+  filter(!is.na(mDRB11Cd.x)) %>%
+  filter(str_detect(mDRB11Cd.x, ":")) %>% #This filters out typing in low resolution
+  nrow()
+)
+#Calculate counts and frequencies of HLA-DRB1 alleles. Looks for alleles in both of the DRB1 typing fields. 
+(HLA_DRB1_freqs <- NGStested_patients %>% 
+  filter(!is.na(mDRB11Cd.x)) %>%
+  filter(str_detect(mDRB11Cd.x, ":")) %>%
+  mutate(mDRB12Cd.x = coalesce(mDRB12Cd.x, mDRB11Cd.x)) %>%
+  select(starts_with("mDRB1")) %>%
+  pivot_longer(cols = everything(), values_to = "DRB1_allele") %>%
+  count(DRB1_allele, name = "Count") %>%
+  arrange(desc(Count)) %>%
+  mutate(Freq = Count/HLA_DRB1_n/2)
+)
+write.xlsx(HLA_DRB1_freqs, file = "HLA-DRB1 frequencies.xlsx", overwrite = T)
+```
+
+```{r}
+#Frequency calculations for HLA-DQB1
+
+#Calculate number of patients with DQB1 typing
+(HLA_DQB1_n <- NGStested_patients %>% 
+  filter(!is.na(mDQB11cd.x)) %>%
+  filter(str_detect(mDQB11cd.x, ":")) %>% #This filters out typing in low resolution
+  nrow()
+)
+#Calculate counts and frequencies of HLA-DQB1 alleles. Looks for alleles in both of the DQB1 typing fields. 
+(HLA_DQB1_freqs <- NGStested_patients %>% 
+  filter(!is.na(mDQB11cd.x)) %>%
+  filter(str_detect(mDQB11cd.x, ":")) %>%
+  mutate(mDQB12cd.x = coalesce(mDQB12cd.x, mDQB11cd.x)) %>%
+  select(starts_with("mDQB1")) %>%
+  pivot_longer(cols = everything(), values_to = "DQB1_allele") %>%
+  count(DQB1_allele, name = "Count") %>%
+  arrange(desc(Count)) %>%
+  mutate(Freq = Count/HLA_DQB1_n/2)
+)
+write.xlsx(HLA_DQB1_freqs, file = "HLA-DQB1 frequencies.xlsx", overwrite = T)
+```
+
+```{r}
+#Frequency calculations for HLA-DQA1
+
+#Calculate number of patients with DQA1 typing
+(HLA_DQA1_n <- NGStested_patients %>% 
+  filter(!is.na(mDQA11Cd.x)) %>%
+  filter(str_detect(mDQA11Cd.x, ":")) %>% #This filters out typing in low resolution
+  nrow()
+)
+#Calculate counts and frequencies of HLA-DQA1 alleles. Looks for alleles in both of the DQA1 typing fields. 
+(HLA_DQA1_freqs <- NGStested_patients %>% 
+  filter(!is.na(mDQA11Cd.x)) %>%
+  filter(str_detect(mDQA11Cd.x, ":")) %>%
+  mutate(mDQA12Cd.x = coalesce(mDQA12Cd.x, mDQA11Cd.x)) %>%
+  select(starts_with("mDQA1")) %>%
+  pivot_longer(cols = everything(), values_to = "DQA1_allele") %>%
+  count(DQA1_allele, name = "Count") %>%
+  arrange(desc(Count)) %>%
+  mutate(Freq = Count/HLA_DQA1_n/2)
+)
+write.xlsx(HLA_DQA1_freqs, file = "HLA-DQA1 frequencies.xlsx", overwrite = T)
+```
+
+```{r}
+#Frequency calculations for HLA-DPA1
+
+#Calculate number of patients with DPA1 typing
+(HLA_DPA1_n <- NGStested_patients %>% 
+  filter(!is.na(mDPA11Cd)) %>%
+  filter(str_detect(mDPA11Cd, ":")) %>% #This filters out typing in low resolution
+  nrow()
+)
+#Calculate counts and frequencies of HLA-DPA1 alleles. Looks for alleles in both of the DPA1 typing fields. 
+(HLA_DPA1_freqs <- NGStested_patients %>% 
+  filter(!is.na(mDPA11Cd)) %>%
+  filter(str_detect(mDPA11Cd, ":")) %>%
+  mutate(mDPA12Cd = coalesce(mDPA12Cd, mDPA11Cd)) %>%
+  select(starts_with("mDPA1")) %>%
+  pivot_longer(cols = everything(), values_to = "DPA1_allele") %>%
+  count(DPA1_allele, name = "Count") %>%
+  arrange(desc(Count)) %>%
+  mutate(Freq = Count/HLA_DPA1_n/2)
+)
+write.xlsx(HLA_DPA1_freqs, file = "HLA-DPA1 frequencies.xlsx", overwrite = T)
+```
+
+```{r}
+#Frequency calculations for HLA-DPB1
+
+#Calculate number of patients with DPB1 typing
+(HLA_DPB1_n <- NGStested_patients %>% 
+  filter(!is.na(mDPB11cd)) %>%
+  filter(str_detect(mDPB11cd, ":")) %>% #This filters out typing in low resolution
+  nrow()
+)
+#Calculate counts and frequencies of HLA-DPB1 alleles. Looks for alleles in both of the DPB1 typing fields. 
+(HLA_DPB1_freqs <- NGStested_patients %>% 
+  filter(!is.na(mDPB11cd)) %>%
+  filter(str_detect(mDPB11cd, ":")) %>%
+  mutate(mDPB12cd = coalesce(mDPB12cd, mDPB11cd)) %>%
+  select(starts_with("mDPB1")) %>%
+  pivot_longer(cols = everything(), values_to = "DPB1_allele") %>%
+  count(DPB1_allele, name = "Count") %>%
+  arrange(desc(Count)) %>%
+  mutate(Freq = Count/HLA_DPB1_n/2)
+)
+write.xlsx(HLA_DPB1_freqs, file = "HLA-DPB1 frequencies.xlsx", overwrite = T)
+```
